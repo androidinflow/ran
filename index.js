@@ -30,6 +30,28 @@ let chatManager = new ChatManager(
 
 chatManager.init();
 
+// Rate limiting setup
+const queue = [];
+let isProcessing = false;
+const RATE_LIMIT_DELAY = 2500; // 2.5 second delay between requests
+
+async function processQueue() {
+  if (isProcessing || queue.length === 0) return;
+
+  isProcessing = true;
+  const task = queue.shift();
+
+  try {
+    await task();
+  } catch (error) {
+    console.error("Error processing queue task:", error);
+  } finally {
+    isProcessing = false;
+    // Wait for rate limit before processing next item
+    setTimeout(() => processQueue(), RATE_LIMIT_DELAY);
+  }
+}
+
 const handleUserStart = async (ctx) => {
   const { id, username = "Anonymous", first_name: name } = ctx.message.from;
   console.log(id, username, name, "sends start command");
@@ -146,17 +168,72 @@ const gifHandler = async (ctx) => {
 
     if (gifs.length > 0) {
       const randomGif = gifs[Math.floor(Math.random() * gifs.length)];
-      // Send GIF with caption containing bot link
-      await ctx.replyWithAnimation(
-        { url: randomGif },
-        {
-          caption: `🔞 برای دریافت گیف های بیشتر عضو ربات شوید:\n@soorakhi_bot\n\n🎭 چت ناشناس و محتوای بزرگسالان\n👇 همین حالا عضو شوید 👇\nhttps://t.me/soorakhi_bot?start=${userId}-${user.id}`,
-          reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback("📤 اشتراک‌گذاری", "share_link")],
-          ]),
+      console.log(`Selected GIF URL: ${randomGif}`);
+
+      try {
+        // Download the GIF
+        const gifResponse = await axios({
+          method: "get",
+          url: randomGif,
+          responseType: "arraybuffer",
+          timeout: 30000,
+          headers: {
+            Accept: "image/gif,image/*,*/*",
+            "Accept-Encoding": "gzip, deflate, br",
+            Referer: "https://pornogifs.net/",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+          },
+          maxContentLength: 10 * 1024 * 1024,
+        });
+
+        console.log("GIF downloaded, size:", gifResponse.data.length, "bytes");
+
+        // Create buffer
+        const buffer = Buffer.from(gifResponse.data);
+        if (buffer.length === 0) {
+          throw new Error("Downloaded buffer is empty");
         }
-      );
-      await chatManager.updateUser(user.id, user.media_uses + 1);
+
+        console.log("Sending GIF to Telegram...");
+
+        // Send using InputFile
+        const sendGifTask = () =>
+          ctx.telegram.sendAnimation(
+            ctx.chat.id,
+            {
+              source: buffer,
+              filename: "animation.gif",
+            },
+            {
+              caption: `🔞 برای دریافت گیف های بیشتر عضو ربات شوید:\n@soorakhi_bot\n\n🎭 چت ناشناس و محتوای بزرگسالان\n👇 همین حالا عضو شوید 👇\nhttps://t.me/soorakhi_bot?start=${userId}-${user.id}`,
+              reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback("📤 اشتراک‌گذاری", "share_link")],
+              ]),
+            }
+          );
+
+        // Add to queue
+        queue.push(sendGifTask);
+        processQueue();
+
+        console.log("GIF queued for sending");
+        await chatManager.updateUser(user.id, user.media_uses + 1);
+      } catch (downloadError) {
+        console.error("Error downloading or sending GIF:", downloadError);
+        if (downloadError.response?.error_code === 429) {
+          const retryAfter =
+            downloadError.response.parameters.retry_after || 30;
+          await ctx.reply(
+            `⚠️ لطفاً ${retryAfter} ثانیه صبر کنید و دوباره تلاش کنید.`,
+            {
+              reply_markup: KEYBOARDS.home.reply_markup,
+            }
+          );
+        } else {
+          throw new Error(`Failed to process GIF: ${downloadError.message}`);
+        }
+      }
     } else {
       await ctx.reply(
         "متأسفم، نتوانستم هیچ GIF پیدا کنیم. لطفاً بعداً دوباره تلاش کنید.",
@@ -166,7 +243,7 @@ const gifHandler = async (ctx) => {
       );
     }
   } catch (error) {
-    console.error("Error fetching GIF:", error);
+    console.error("Error in gifHandler:", error);
     await ctx.reply(
       "متأسفم، خطایی در دریافت GIF رخ داد. لطفاً بعداً دوباره تلاش کنید.",
       {
