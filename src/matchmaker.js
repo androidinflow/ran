@@ -19,33 +19,31 @@ class MatchMaker {
       ["🚪 خروج"],
       ["ℹ️ اطلاعات شریک"],
     ]).resize();
+    this.userCache = new Map(); // Add caching
+    this.roomCache = new Map();
   }
 
   async init() {
-    const fetchQueues = async () => {
-      try {
-        const queues = await pb.collection("queues").getList(1, 2, {
-          sort: "created",
-        });
-        if (queues.items.length === 2) {
-          const newParticipants = queues.items.map((q) => q.user_id);
-          for (const q of queues.items) {
-            await pb.collection("queues").delete(q.id);
-          }
-          await this.createRoom(newParticipants);
-        }
-      } catch (err) {
-        if (!err.isAbort) {
-          console.error("Error in init:", err);
-        }
-      }
-    };
+    if (this.intervalId) clearInterval(this.intervalId);
+    this.intervalId = setInterval(this.matchUsers.bind(this), 2000);
+  }
 
-    // Clear any existing interval before setting a new one
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
+  async matchUsers() {
+    try {
+      const queues = await pb.collection("queues").getList(1, 2, {
+        sort: "created",
+      });
+
+      if (queues.items.length === 2) {
+        const participants = queues.items.map((q) => q.user_id);
+        await Promise.all([
+          ...queues.items.map((q) => pb.collection("queues").delete(q.id)),
+          this.createRoom(participants),
+        ]);
+      }
+    } catch (err) {
+      if (!err.isAbort) console.error("Matching error:", err);
     }
-    this.intervalId = setInterval(fetchQueues, 2000);
   }
 
   async createRoom(newParticipants) {
@@ -80,48 +78,37 @@ class MatchMaker {
 
   async findMatch(userID) {
     try {
-      // Check if the user is already in a queue
-      let existingQueue;
-      try {
-        existingQueue = await pb
-          .collection("queues")
-          .getFirstListItem(`user_id="${userID}"`);
-      } catch (error) {
-        if (error.status !== 404) {
-          // Unexpected error when checking queue
-          throw error;
-        }
-      }
-
+      // Check if user is already in a queue
+      const existingQueue = await this.getQueueForUser(userID);
       if (existingQueue) {
-        tg.sendMessage(userID, text.FIND.WARNING_1);
+        await tg.sendMessage(userID, text.FIND.WARNING_1, {
+          reply_markup: this.searchingKeyboard.reply_markup,
+        });
         return;
       }
 
-      // Check if the user is already in a room
-      let existingRoom;
-      try {
-        existingRoom = await pb
-          .collection("rooms")
-          .getFirstListItem(`participans~"${userID}"`);
-      } catch (error) {
-        if (error.status !== 404) {
-          // Unexpected error when checking rooms
-          throw error;
-        }
-      }
-
+      // Check if user is already in a room
+      const existingRoom = await this.getRoomForUser(userID);
       if (existingRoom) {
-        tg.sendMessage(userID, text.FIND.WARNING_2);
+        await tg.sendMessage(userID, text.FIND.WARNING_2, {
+          reply_markup: this.chattingKeyboard.reply_markup,
+        });
         return;
       }
 
-      // If user is not in queue or room, add them to the queue
-      await pb.collection("queues").create({ user_id: userID });
-      tg.sendMessage(userID, text.FIND.LOADING, this.searchingKeyboard);
+      // If user is neither in queue nor in room, add them to queue
+      await pb.collection("queues").create({
+        user_id: userID,
+      });
+
+      await tg.sendMessage(userID, text.FIND.LOADING, {
+        reply_markup: this.searchingKeyboard.reply_markup,
+      });
     } catch (err) {
-      console.error("Error in find method:", err);
-      tg.sendMessage(userID, text.ERROR);
+      console.error("Error in findMatch:", err);
+      await tg.sendMessage(userID, text.ERROR, {
+        reply_markup: this.initialKeyboard.reply_markup,
+      });
     }
   }
 
@@ -458,7 +445,7 @@ class MatchMaker {
     }
   }
 
-  async saveUser(userID, username, name) {
+  async saveUser(userID, username, name, referrerId = null) {
     try {
       const existingUser = await this.getUser(userID);
       if (existingUser) {
@@ -478,7 +465,7 @@ class MatchMaker {
           points: 0,
           media_uses: 0,
           referrals: [],
-          referred_by: null,
+          referred_by: referrerId,
         });
         console.log(`New user ${userID} created successfully`);
         return newUser.id;

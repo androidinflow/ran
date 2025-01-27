@@ -5,10 +5,6 @@ console.log(`Node.js version: ${process.version}`);
 const text = require("./src/config/lang/text.json");
 const pb = require("./src/config/pocketbase");
 
-const express = require("express");
-const app = express();
-const port = process.env.PORT || 5000;
-
 const { Telegraf } = require("telegraf");
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -17,97 +13,120 @@ const cheerio = require("cheerio");
 
 const { Markup } = require("telegraf");
 
-const homeKeyboard = Markup.keyboard([["🔍 یافتن چت", "🍆گیف👾"]]).resize();
-
-const waitingKeyboard = Markup.keyboard([["🚪 خروج"]]).resize();
-
-const chatKeyboard = Markup.keyboard([
-  ["🚪 خروج"],
-  ["ℹ️ اطلاعات شریک"],
-]).resize();
+// Define keyboards once at the top level
+const KEYBOARDS = {
+  home: Markup.keyboard([["🔍 یافتن چت", "🍆گیف👾"]]).resize(),
+  waiting: Markup.keyboard([["🚪 خروج"]]).resize(),
+  chat: Markup.keyboard([["🚪 خروج"], ["ℹ️ اطلاعات شریک"]]).resize(),
+};
 
 const ChatManager = require("./src/matchmaker");
 let chatManager = new ChatManager(
-  homeKeyboard,
-  waitingKeyboard,
-  chatKeyboard,
-  homeKeyboard
+  KEYBOARDS.home,
+  KEYBOARDS.waiting,
+  KEYBOARDS.chat,
+  KEYBOARDS.home
 );
 
 chatManager.init();
 
 const handleUserStart = async (ctx) => {
   const { id, username = "Anonymous", first_name: name } = ctx.message.from;
-  console.log(id, username, name);
-  ctx.reply(text.START, chatManager.initialKeyboard);
+  console.log(id, username, name, "sends start command");
 
-  const referralCode = ctx.startPayload;
-  if (referralCode) {
-    console.log("referralCode", referralCode);
-    const [referrerId, referrerTid] = referralCode.split("-");
-    if (referrerId === id.toString()) {
-      await ctx.reply("شما نمیتوانید خودتان را به عنوان شریک ثبت کنید.", {
-        reply_markup: homeKeyboard.reply_markup,
-      });
-      return;
-    }
+  try {
+    const existingUser = await chatManager.getUser(id);
 
-    try {
-      const existingUser = await chatManager.getUser(id);
-      if (!existingUser) {
-        console.log(
-          `User ${id} doesn't exist in database. Giving points to the user`
-        );
+    // Handle referral code if present and user is new
+    const referralCode = ctx.startPayload;
+    if (referralCode && !existingUser) {
+      const [referrerId, referrerTid] = referralCode.split("-");
 
-        // Save the new user first
-        await chatManager.saveUser(id, username, name);
+      if (referrerId === id.toString()) {
+        await ctx.reply("شما نمیتوانید خودتان را به عنوان شریک ثبت کنید.", {
+          reply_markup: KEYBOARDS.home.reply_markup,
+        });
+        return;
+      }
 
-        // Now update the referrer's information
+      try {
+        // Check if user was previously referred
         const referrer = await pb
           .collection("telegram_users")
           .getOne(referrerTid);
-        const updatedReferrals = [...(referrer.referrals || []), id];
-        await pb.collection("telegram_users").update(referrerTid, {
-          username: referrer.username, // Keep the original username
-          name: referrer.name, // Keep the original name
-          points: referrer.points + 10,
-          referrals: updatedReferrals,
-        });
-      } else {
-        console.log(`User ${id} already exists in database`);
+        if (!referrer.referrals.includes(id)) {
+          const updatedReferrals = [...(referrer.referrals || []), id];
+          await pb.collection("telegram_users").update(referrerTid, {
+            username: referrer.username,
+            name: referrer.name,
+            points: referrer.points + 10,
+            referrals: updatedReferrals,
+          });
+
+          // Save the referrer ID for the new user
+          await chatManager.saveUser(id, username, name, referrerId);
+
+          // Send notification to referrer
+          await bot.telegram.sendMessage(
+            referrerId,
+            `🎉 تبریک! شما 10 امتیاز برای دعوت از کاربر جدید دریافت کردید!\n\nامتیاز فعلی شما: ${
+              referrer.points + 10
+            }`
+          );
+        }
+      } catch (err) {
+        console.error("Error updating referrer:", err);
       }
-    } catch (err) {
-      console.error("Error checking if user exists or updating referrer.", err);
+    } else {
+      // Regular user save without referral
+      await chatManager.saveUser(id, username, name);
     }
+
+    // Send welcome message
+    ctx.reply(text.START, chatManager.initialKeyboard);
+  } catch (err) {
+    console.error("Error in handleUserStart:", err);
+    ctx.reply(text.ERROR, chatManager.initialKeyboard);
   }
 };
 
 const gifHandler = async (ctx) => {
   const userId = ctx.message.from.id;
   const { username = "Anonymous", first_name: name } = ctx.message.from;
-  console.log(userId, username, name);
 
   try {
     await chatManager.saveUser(userId, username, name);
-    console.log(`Media request from user ${userId}`);
-
     const user = await chatManager.getUser(userId);
-    if (user.media_uses >= 9 && user.points == 0) {
-      await ctx.reply(
-        "متأسفم، شما بیش از حد استفاده کرده اید. لطفاً بعداً دوباره تلاش کنید.",
+
+    if (user.media_uses >= 9 && user.points === 0) {
+      // Send a formatted message explaining the limit and referral system
+      await ctx.replyWithHTML(
+        `⚠️ <b>محدودیت استفاده</b>\n\n` +
+          `😔 متأسفم، شما به محدودیت استفاده رسیده‌اید.\n\n` +
+          `💡 برای دریافت امتیاز بیشتر می‌توانید دوستان خود را دعوت کنید!\n\n` +
+          `🎁 <b>به ازای هر دعوت: ۱۰ امتیاز</b>\n\n` +
+          `📲 لینک دعوت شما:`,
         {
-          reply_markup: homeKeyboard.reply_markup,
+          reply_markup: KEYBOARDS.home.reply_markup,
         }
       );
-      await ctx.reply(
-        "this is your referral link to invite friends and earn points:",
+
+      // Send referral link with description that will be visible when forwarded
+      await ctx.replyWithHTML(
+        `🎭 سوراخی بات | Soorakhi Bot 🎭\n\n` +
+          `🔞 بهترین ربات چت ناشناس و محتوای بزرگسالان\n` +
+          `👥 چت ناشناس با کاربران تصادفی\n` +
+          `🎯 محتوای اختصاصی و جذاب\n` +
+          `✨ رابط کاربری ساده و کاربردی\n\n` +
+          `👇 همین حالا عضو شوید 👇\n` +
+          `https://t.me/soorakhi_bot?start=${userId}-${user.id}`,
         {
-          reply_markup: homeKeyboard.reply_markup,
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback("📤 اشتراک‌گذاری لینک", "share_link")],
+          ]),
+          disable_web_page_preview: true,
         }
       );
-      await ctx.reply(`https://t.me/soorakhi_bot?start=${userId}-${user.id}`, {
-        reply_markup: homeKeyboard.reply_markup,
-      });
       return;
     }
 
@@ -127,15 +146,22 @@ const gifHandler = async (ctx) => {
 
     if (gifs.length > 0) {
       const randomGif = gifs[Math.floor(Math.random() * gifs.length)];
-      await ctx.replyWithAnimation({ url: randomGif });
+      // Send GIF with caption containing bot link
+      await ctx.replyWithAnimation(
+        { url: randomGif },
+        {
+          caption: `🔞 برای دریافت گیف های بیشتر عضو ربات شوید:\n@soorakhi_bot\n\n🎭 چت ناشناس و محتوای بزرگسالان\n👇 همین حالا عضو شوید 👇\nhttps://t.me/soorakhi_bot?start=${userId}-${user.id}`,
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback("📤 اشتراک‌گذاری", "share_link")],
+          ]),
+        }
+      );
       await chatManager.updateUser(user.id, user.media_uses + 1);
-      ctx.reply(`تعداد استفاده از محتوا: ${user.media_uses + 1}`);
-      ctx.reply(`points: ${user.points}`);
     } else {
       await ctx.reply(
         "متأسفم، نتوانستم هیچ GIF پیدا کنیم. لطفاً بعداً دوباره تلاش کنید.",
         {
-          reply_markup: homeKeyboard.reply_markup,
+          reply_markup: KEYBOARDS.home.reply_markup,
         }
       );
     }
@@ -144,7 +170,7 @@ const gifHandler = async (ctx) => {
     await ctx.reply(
       "متأسفم، خطایی در دریافت GIF رخ داد. لطفاً بعداً دوباره تلاش کنید.",
       {
-        reply_markup: homeKeyboard.reply_markup,
+        reply_markup: KEYBOARDS.home.reply_markup,
       }
     );
   }
@@ -161,9 +187,28 @@ bot.hears("🔍 یافتن چت", (ctx) => {
   chatManager.findMatch(userId);
 });
 
-bot.hears("🚪 خروج", (ctx) => {
+bot.hears("🚪 خروج", async (ctx) => {
   const userId = ctx.message.from.id;
-  chatManager.exitRoom(userId);
+  try {
+    const room = await chatManager.getRoom(userId);
+    if (room) {
+      await ctx.reply("آیا مطمئن هستید که می‌خواهید گفتگو را پایان دهید؟", {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "✅ بله", callback_data: "confirm_exit" },
+              { text: "❌ خیر", callback_data: "cancel_exit" },
+            ],
+          ],
+        },
+      });
+    } else {
+      chatManager.exitRoom(userId);
+    }
+  } catch (error) {
+    console.error("Error in exit confirmation:", error);
+    chatManager.exitRoom(userId);
+  }
 });
 
 bot.hears("ℹ️ اطلاعات شریک", async (ctx) => {
@@ -234,15 +279,50 @@ bot.on("web_app_data", (ctx) => {
   // Process the data as needed
 });
 
+bot.action("share_link", async (ctx) => {
+  const userId = ctx.from.id;
+  const user = await chatManager.getUser(userId);
+
+  await ctx.replyWithHTML(
+    `🎭 سوراخی بات | Soorakhi Bot 🎭\n\n` +
+      `🔞 بهترین ربات چت ناشناس و محتوای بزرگسالان\n` +
+      `👥 چت ناشناس با کاربران تصادفی\n` +
+      `🎯 محتوای اختصاصی و جذاب\n` +
+      `✨ رابط کاربری ساده و کاربردی\n\n` +
+      `👇 همین حالا عضو شوید 👇\n` +
+      `https://t.me/soorakhi_bot?start=${userId}-${user.id}`,
+    {
+      reply_markup: KEYBOARDS.home.reply_markup,
+      disable_web_page_preview: true,
+    }
+  );
+
+  await ctx.answerCbQuery("پیام دعوت آماده ارسال شد!");
+});
+
+// Action handlers for exit confirmation
+bot.action("confirm_exit", async (ctx) => {
+  const userId = ctx.from.id;
+  try {
+    await ctx.deleteMessage();
+    await chatManager.exitRoom(userId);
+    await ctx.answerCbQuery("گفتگو پایان یافت.");
+  } catch (error) {
+    console.error("Error in confirm exit:", error);
+  }
+});
+
+bot.action("cancel_exit", async (ctx) => {
+  try {
+    await ctx.deleteMessage();
+    await ctx.answerCbQuery("ادامه گفتگو.");
+  } catch (error) {
+    console.error("Error in cancel exit:", error);
+  }
+});
+
 // Launch the bot
 bot.launch();
-
-// Set up the Express server
-app.get("/", (req, res) => res.send("Hello World!"));
-
-app.listen(port, () => {
-  console.log(`Server running at http://localhost:${port}`);
-});
 
 // Enable graceful stop
 process.once("SIGINT", () => bot.stop("SIGINT"));
